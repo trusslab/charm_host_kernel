@@ -54,6 +54,8 @@
 #include <asm/byteorder.h>
 #include <linux/moduleparam.h>
 
+
+
 #include "usb.h"
 
 #define USB_MAXBUS			64
@@ -139,6 +141,12 @@ module_param(usbfs_memory_mb, uint, 0644);
 MODULE_PARM_DESC(usbfs_memory_mb,
 		"maximum MB allowed for usbfs buffers (0 = no limit)");
 
+//Charm start
+static bool usbfs_charm_disconnect = false;
+module_param(usbfs_charm_disconnect, bool, 0664);
+MODULE_PARM_DESC(usbfs_charm_disconnect, "true to disconnect Charm USB connections");
+//Charm end
+
 /* Hard limit, necessary to avoid arithmetic overflow */
 #define USBFS_XFER_MAX		(UINT_MAX / 2 - 1000000)
 
@@ -160,6 +168,7 @@ static int usbfs_increase_memory_usage(unsigned amount)
 		lim <<= 20;
 
 	atomic_add(amount, &usbfs_memory_usage);
+
 	if (atomic_read(&usbfs_memory_usage) <= lim)
 		return 0;
 	atomic_sub(amount, &usbfs_memory_usage);
@@ -370,6 +379,98 @@ err:
 	return ret;
 }
 
+//Charm start
+ssize_t usbdev_read_kernel(struct file *file, char *buf, size_t nbytes,
+			   loff_t *ppos)
+{
+	struct usb_dev_state *ps = file->private_data;
+	struct usb_device *dev = ps->dev;
+	ssize_t ret = 0;
+	unsigned len;
+	loff_t pos;
+	int i;
+
+	pos = *ppos;
+	usb_lock_device(dev);
+	if (!connected(ps)) {
+		ret = -ENODEV;
+		goto err;
+	} else if (pos < 0) {
+		ret = -EINVAL;
+		goto err;
+	}
+
+	if (pos < sizeof(struct usb_device_descriptor)) {
+		/* 18 bytes - fits on the stack */
+		struct usb_device_descriptor temp_desc;
+
+		memcpy(&temp_desc, &dev->descriptor, sizeof(dev->descriptor));
+		le16_to_cpus(&temp_desc.bcdUSB);
+		le16_to_cpus(&temp_desc.idVendor);
+		le16_to_cpus(&temp_desc.idProduct);
+		le16_to_cpus(&temp_desc.bcdDevice);
+
+		len = sizeof(struct usb_device_descriptor) - pos;
+		if (len > nbytes)
+			len = nbytes;
+		////if (copy_to_user(buf, ((char *)&temp_desc) + pos, len)) {
+		////	ret = -EFAULT;
+		////	goto err;
+		////}
+		memcpy(buf, ((char *)&temp_desc) + pos, len);
+
+		*ppos += len;
+		buf += len;
+		nbytes -= len;
+		ret += len;
+	}
+
+	pos = sizeof(struct usb_device_descriptor);
+	for (i = 0; nbytes && i < dev->descriptor.bNumConfigurations; i++) {
+		struct usb_config_descriptor *config =
+			(struct usb_config_descriptor *)dev->rawdescriptors[i];
+		unsigned int length = le16_to_cpu(config->wTotalLength);
+
+		if (*ppos < pos + length) {
+
+			/* The descriptor may claim to be longer than it
+			 * really is.  Here is the actual allocated length. */
+			unsigned alloclen =
+				le16_to_cpu(dev->config[i].desc.wTotalLength);
+
+			len = length - (*ppos - pos);
+			if (len > nbytes)
+				len = nbytes;
+
+			/* Simply don't write (skip over) unallocated parts */
+			if (alloclen > (*ppos - pos)) {
+				alloclen -= (*ppos - pos);
+				////if (copy_to_user(buf,
+				////    dev->rawdescriptors[i] + (*ppos - pos),
+				////    min(len, alloclen))) {
+				////	ret = -EFAULT;
+				////	goto err;
+				////}
+				memcpy(buf, dev->rawdescriptors[i] + (*ppos - pos),
+				    min(len, alloclen));
+			}
+
+			*ppos += len;
+			buf += len;
+			nbytes -= len;
+			ret += len;
+		}
+
+		pos += length;
+	}
+
+err:
+	usb_unlock_device(dev);
+	return ret;
+}
+EXPORT_SYMBOL(usbdev_read_kernel);
+//Charm end
+
 /*
  * async list handling
  */
@@ -447,6 +548,28 @@ static struct async *async_getcompleted(struct usb_dev_state *ps)
 	spin_unlock_irqrestore(&ps->lock, flags);
 	return as;
 }
+
+//Charm start
+static struct async *async_getcompleted_single(struct usb_dev_state *ps, void __user *arg)
+{
+	unsigned long flags;
+	struct async *as = NULL, *tmp = NULL;
+
+	spin_lock_irqsave(&ps->lock, flags);
+	if (!list_empty(&ps->async_completed)) {
+		list_for_each_entry_safe(as, tmp, &ps->async_completed, asynclist) {
+
+			if (as->userurb == arg) {
+				list_del_init(&as->asynclist);
+				spin_unlock_irqrestore(&ps->lock, flags);
+				return as;
+			}
+		}
+	}
+	spin_unlock_irqrestore(&ps->lock, flags);
+	return NULL;
+}
+//Charm end
 
 static struct async *async_getpending(struct usb_dev_state *ps,
 					     void __user *userurb)
@@ -554,6 +677,32 @@ static int copy_urb_data_to_user(u8 __user *userbuffer, struct urb *urb)
 
 	return 0;
 }
+
+//Charm start
+static void copy_urb_data_to_kernel(u8 *userbuffer, struct urb *urb)
+{
+	unsigned i, len, size;
+
+	if (urb->number_of_packets > 0)		/* Isochronous */
+		len = urb->transfer_buffer_length;
+	else					/* Non-Isoc */
+		len = urb->actual_length;
+
+	if (urb->num_sgs == 0) {
+		memcpy(userbuffer, urb->transfer_buffer, len);
+		return;
+	}
+
+	for (i = 0; i < urb->num_sgs && len; i++) {
+		size = (len > USB_SG_SIZE) ? USB_SG_SIZE : len;
+		memcpy(userbuffer, sg_virt(&urb->sg[i]), size);
+		userbuffer += size;
+		len -= size;
+	}
+
+	return;
+}
+//Charm end
 
 #define AS_CONTINUATION	1
 #define AS_UNLINK	2
@@ -918,8 +1067,9 @@ static int parse_usbdevfs_streams(struct usb_dev_state *ps,
 		return -EINVAL;
 
 	eps = kmalloc(num_eps * sizeof(*eps), GFP_KERNEL);
-	if (!eps)
+	if (!eps){
 		return -ENOMEM;
+	}
 
 	for (i = 0; i < num_eps; i++) {
 		if (get_user(ep, &streams->eps[i])) {
@@ -990,7 +1140,6 @@ static int usbdev_open(struct inode *inode, struct file *file)
 	struct usb_device *dev = NULL;
 	struct usb_dev_state *ps;
 	int ret;
-
 	ret = -ENOMEM;
 	ps = kzalloc(sizeof(struct usb_dev_state), GFP_KERNEL);
 	if (!ps)
@@ -1491,8 +1640,9 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
 		if (uurb->buffer_length < 8)
 			return -EINVAL;
 		dr = kmalloc(sizeof(struct usb_ctrlrequest), GFP_KERNEL);
-		if (!dr)
+		if (!dr){
 			return -ENOMEM;
+		}
 		if (copy_from_user(dr, uurb->buffer, 8)) {
 			ret = -EFAULT;
 			goto error;
@@ -1803,6 +1953,281 @@ static int proc_do_submiturb(struct usb_dev_state *ps, struct usbdevfs_urb *uurb
 	return ret;
 }
 
+//Charm start
+static int proc_do_submiturb_kernel(struct usb_dev_state *ps, struct usbdevfs_urb *uurb,
+			struct usbdevfs_iso_packet_desc *iso_frame_desc,
+			void *arg)
+{
+	struct usbdevfs_iso_packet_desc *isopkt = NULL;
+	struct usb_host_endpoint *ep;
+	struct async *as = NULL;
+	struct usb_ctrlrequest *dr = NULL;
+	unsigned int u, totlen, isofrmlen;
+	int i, ret, is_in, num_sgs = 0, ifnum = -1;
+	int number_of_packets = 0;
+	unsigned int stream_id = 0;
+	void *buf;
+
+	if (uurb->flags & ~(USBDEVFS_URB_ISO_ASAP |
+				USBDEVFS_URB_SHORT_NOT_OK |
+				USBDEVFS_URB_BULK_CONTINUATION |
+				USBDEVFS_URB_NO_FSBR |
+				USBDEVFS_URB_ZERO_PACKET |
+				USBDEVFS_URB_NO_INTERRUPT))
+		return -EINVAL;
+	if (uurb->buffer_length > 0 && !uurb->buffer)
+		return -EINVAL;
+	if (!(uurb->type == USBDEVFS_URB_TYPE_CONTROL &&
+	    (uurb->endpoint & ~USB_ENDPOINT_DIR_MASK) == 0)) {
+		ifnum = findintfep(ps->dev, uurb->endpoint);
+		if (ifnum < 0)
+			return ifnum;
+		ret = checkintf(ps, ifnum);
+		if (ret)
+			return ret;
+	}
+	ep = ep_to_host_endpoint(ps->dev, uurb->endpoint);
+	if (!ep)
+		return -ENOENT;
+	is_in = (uurb->endpoint & USB_ENDPOINT_DIR_MASK) != 0;
+
+	u = 0;
+	switch (uurb->type) {
+
+	case USBDEVFS_URB_TYPE_BULK:
+		switch (usb_endpoint_type(&ep->desc)) {
+		case USB_ENDPOINT_XFER_CONTROL:
+		case USB_ENDPOINT_XFER_ISOC:
+			return -EINVAL;
+		case USB_ENDPOINT_XFER_INT:
+			/* allow single-shot interrupt transfers */
+			uurb->type = USBDEVFS_URB_TYPE_INTERRUPT;
+			goto interrupt_urb;
+		}
+		num_sgs = DIV_ROUND_UP(uurb->buffer_length, USB_SG_SIZE);
+		if (num_sgs == 1 || num_sgs > ps->dev->bus->sg_tablesize)
+			num_sgs = 0;
+		if (ep->streams)
+			stream_id = uurb->stream_id;
+		break;
+
+	case USBDEVFS_URB_TYPE_INTERRUPT:
+		if (!usb_endpoint_xfer_int(&ep->desc))
+			return -EINVAL;
+ interrupt_urb:
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	if (uurb->buffer_length >= USBFS_XFER_MAX) {
+		ret = -EINVAL;
+		goto error;
+	}
+	as = alloc_async(number_of_packets);
+	if (!as) {
+		ret = -ENOMEM;
+		goto error;
+	}
+	as->usbm = find_memory_area(ps, uurb);
+	if (IS_ERR(as->usbm)) {
+		ret = PTR_ERR(as->usbm);
+		as->usbm = NULL;
+		goto error;
+	}
+	/* do not use SG buffers when memory mapped segments
+	 * are in use
+	 */
+	if (as->usbm)
+		num_sgs = 0;
+
+	u += sizeof(struct async) + sizeof(struct urb) + uurb->buffer_length +
+	     num_sgs * sizeof(struct scatterlist);
+	ret = usbfs_increase_memory_usage(u);
+	if (ret)
+		goto error;
+	as->mem_usage = u;
+
+	if (num_sgs) {
+		as->urb->sg = kmalloc(num_sgs * sizeof(struct scatterlist),
+				      GFP_KERNEL);
+		if (!as->urb->sg) {
+			ret = -ENOMEM;
+			goto error;
+		}
+		as->urb->num_sgs = num_sgs;
+		sg_init_table(as->urb->sg, as->urb->num_sgs);
+
+		totlen = uurb->buffer_length;
+		for (i = 0; i < as->urb->num_sgs; i++) {
+			u = (totlen > USB_SG_SIZE) ? USB_SG_SIZE : totlen;
+			buf = kmalloc(u, GFP_KERNEL);
+			if (!buf) {
+				ret = -ENOMEM;
+				goto error;
+			}
+			sg_set_buf(&as->urb->sg[i], buf, u);
+
+			if (!is_in) {
+				memcpy(buf, uurb->buffer, u);
+				uurb->buffer += u;
+			}
+			totlen -= u;
+		}
+	} else if (uurb->buffer_length > 0) {
+		if (as->usbm) {
+			unsigned long uurb_start = (unsigned long)uurb->buffer;
+
+			as->urb->transfer_buffer = as->usbm->mem +
+					(uurb_start - as->usbm->vm_start);
+		} else {
+			as->urb->transfer_buffer = kmalloc(uurb->buffer_length,
+					GFP_KERNEL);
+			if (!as->urb->transfer_buffer) {
+				ret = -ENOMEM;
+				goto error;
+			}
+			if (!is_in) {
+				memcpy(as->urb->transfer_buffer,
+						   uurb->buffer,
+						   uurb->buffer_length);
+			} else if (uurb->type == USBDEVFS_URB_TYPE_ISO) {
+				/*
+				 * Isochronous input data may end up being
+				 * discontiguous if some of the packets are
+				 * short. Clear the buffer so that the gaps
+				 * don't leak kernel data to userspace.
+				 */
+				memset(as->urb->transfer_buffer, 0,
+						uurb->buffer_length);
+			}
+		}
+	}
+	as->urb->dev = ps->dev;
+	as->urb->pipe = (uurb->type << 30) |
+			__create_pipe(ps->dev, uurb->endpoint & 0xf) |
+			(uurb->endpoint & USB_DIR_IN);
+
+	/* This tedious sequence is necessary because the URB_* flags
+	 * are internal to the kernel and subject to change, whereas
+	 * the USBDEVFS_URB_* flags are a user API and must not be changed.
+	 */
+	u = (is_in ? URB_DIR_IN : URB_DIR_OUT);
+	if (uurb->flags & USBDEVFS_URB_ISO_ASAP)
+		u |= URB_ISO_ASAP;
+	if (uurb->flags & USBDEVFS_URB_SHORT_NOT_OK && is_in)
+		u |= URB_SHORT_NOT_OK;
+	if (uurb->flags & USBDEVFS_URB_NO_FSBR)
+		u |= URB_NO_FSBR;
+	if (uurb->flags & USBDEVFS_URB_ZERO_PACKET)
+		u |= URB_ZERO_PACKET;
+	if (uurb->flags & USBDEVFS_URB_NO_INTERRUPT)
+		u |= URB_NO_INTERRUPT;
+	as->urb->transfer_flags = u;
+
+	as->urb->transfer_buffer_length = uurb->buffer_length;
+	as->urb->setup_packet = (unsigned char *)dr;
+	dr = NULL;
+	as->urb->start_frame = uurb->start_frame;
+	as->urb->number_of_packets = number_of_packets;
+	as->urb->stream_id = stream_id;
+
+	if (ep->desc.bInterval) {
+		if (uurb->type == USBDEVFS_URB_TYPE_ISO ||
+				ps->dev->speed == USB_SPEED_HIGH ||
+				ps->dev->speed >= USB_SPEED_SUPER)
+			as->urb->interval = 1 <<
+					min(15, ep->desc.bInterval - 1);
+		else
+			as->urb->interval = ep->desc.bInterval;
+	}
+
+	as->urb->context = as;
+	as->urb->complete = async_completed;
+	for (totlen = u = 0; u < number_of_packets; u++) {
+		as->urb->iso_frame_desc[u].offset = totlen;
+		as->urb->iso_frame_desc[u].length = isopkt[u].length;
+		totlen += isopkt[u].length;
+	}
+	kfree(isopkt);
+	isopkt = NULL;
+	as->ps = ps;
+	as->userurb = arg;
+	if (as->usbm) {
+		unsigned long uurb_start = (unsigned long)uurb->buffer;
+
+		as->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+		as->urb->transfer_dma = as->usbm->dma_handle +
+				(uurb_start - as->usbm->vm_start);
+	} else if (is_in && uurb->buffer_length > 0)
+		as->userbuffer = uurb->buffer;
+	as->signr = uurb->signr;
+	as->ifnum = ifnum;
+	as->pid = get_pid(task_pid(current));
+	as->cred = get_current_cred();
+	security_task_getsecid(current, &as->secid);
+	snoop_urb(ps->dev, as->userurb, as->urb->pipe,
+			as->urb->transfer_buffer_length, 0, SUBMIT,
+			NULL, 0);
+	if (!is_in)
+		snoop_urb_data(as->urb, as->urb->transfer_buffer_length);
+
+	async_newpending(as);
+
+	if (usb_endpoint_xfer_bulk(&ep->desc)) {
+		spin_lock_irq(&ps->lock);
+
+		/* Not exactly the endpoint address; the direction bit is
+		 * shifted to the 0x10 position so that the value will be
+		 * between 0 and 31.
+		 */
+		as->bulk_addr = usb_endpoint_num(&ep->desc) |
+			((ep->desc.bEndpointAddress & USB_ENDPOINT_DIR_MASK)
+				>> 3);
+
+		/* If this bulk URB is the start of a new transfer, re-enable
+		 * the endpoint.  Otherwise mark it as a continuation URB.
+		 */
+		if (uurb->flags & USBDEVFS_URB_BULK_CONTINUATION) {
+			as->bulk_status = AS_CONTINUATION;
+		} else {
+			ps->disabled_bulk_eps &= ~(1 << as->bulk_addr);
+		}
+
+		/* Don't accept continuation URBs if the endpoint is
+		 * disabled because of an earlier error.
+		 */
+		if (ps->disabled_bulk_eps & (1 << as->bulk_addr)) {
+			ret = -EREMOTEIO;
+		} else {
+			ret = usb_submit_urb(as->urb, GFP_ATOMIC);
+		}
+		spin_unlock_irq(&ps->lock);
+	} else {
+		ret = usb_submit_urb(as->urb, GFP_KERNEL);
+	}
+
+	if (ret) {
+		dev_printk(KERN_DEBUG, &ps->dev->dev,
+			   "usbfs: usb_submit_urb returned %d\n", ret);
+		snoop_urb(ps->dev, as->userurb, as->urb->pipe,
+				0, ret, COMPLETE, NULL, 0);
+		async_removepending(as);
+		goto error;
+	}
+	return 0;
+
+ error:
+	if (as && as->usbm)
+		dec_usb_memory_use_count(as->usbm, &as->usbm->urb_use_count);
+	kfree(isopkt);
+	kfree(dr);
+	if (as)
+		free_async(as);
+	return ret;
+}
+//Charm end
+
 static int proc_submiturb(struct usb_dev_state *ps, void __user *arg)
 {
 	struct usbdevfs_urb uurb;
@@ -1814,6 +2239,19 @@ static int proc_submiturb(struct usb_dev_state *ps, void __user *arg)
 			(((struct usbdevfs_urb __user *)arg)->iso_frame_desc),
 			arg);
 }
+
+//Charm start
+static int proc_submiturb_kernel(struct usb_dev_state *ps, void *arg)
+{
+	struct usbdevfs_urb uurb;
+
+	memcpy(&uurb, arg, sizeof(uurb));
+
+	return proc_do_submiturb_kernel(ps, &uurb,
+			(((struct usbdevfs_urb *)arg)->iso_frame_desc),
+			arg);
+}
+//Charm end
 
 static int proc_unlinkurb(struct usb_dev_state *ps, void __user *arg)
 {
@@ -1875,12 +2313,101 @@ err_out:
 	return -EFAULT;
 }
 
+//Charm start
+static int processcompl_kernel(struct async *as, void **arg)
+{
+	struct urb *urb = as->urb;
+	struct usbdevfs_urb *userurb = as->userurb;
+	void *addr = as->userurb;
+	unsigned int i;
+
+	if (as->userbuffer && urb->actual_length) {
+		copy_urb_data_to_kernel(as->userbuffer, urb);
+	}
+        userurb->status = as->status;
+	userurb->actual_length = (int) urb->actual_length;
+	userurb->error_count = urb->error_count;
+
+	if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
+		for (i = 0; i < urb->number_of_packets; i++) {
+			userurb->iso_frame_desc[i].actual_length =
+				urb->iso_frame_desc[i].actual_length;
+			userurb->iso_frame_desc[i].status = (unsigned int)
+				urb->iso_frame_desc[i].status;
+		}
+	}
+
+	*arg = addr;
+	return 0;
+}
+
+static int processcompl_single(struct async *as)
+{
+	struct urb *urb = as->urb;
+	struct usbdevfs_urb __user *userurb = as->userurb;
+	void __user *addr = as->userurb;
+	unsigned int i;
+
+	if (as->userbuffer && urb->actual_length) {
+		if (copy_urb_data_to_user(as->userbuffer, urb))
+			goto err_out;
+	}
+	if (put_user(as->status, &userurb->status))
+		goto err_out;
+	if (put_user(urb->actual_length, &userurb->actual_length))
+		goto err_out;
+	if (put_user(urb->error_count, &userurb->error_count))
+		goto err_out;
+
+	if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
+		for (i = 0; i < urb->number_of_packets; i++) {
+			if (put_user(urb->iso_frame_desc[i].actual_length,
+				     &userurb->iso_frame_desc[i].actual_length))
+				goto err_out;
+			if (put_user(urb->iso_frame_desc[i].status,
+				     &userurb->iso_frame_desc[i].status))
+				goto err_out;
+		}
+	}
+
+	return 0;
+
+err_out:
+	return -EFAULT;
+}
+
+static int processcompl_single_kernel(struct async *as)
+{
+	struct urb *urb = as->urb;
+	struct usbdevfs_urb *userurb = as->userurb;
+	void *addr = as->userurb;
+	unsigned int i;
+
+	if (as->userbuffer && urb->actual_length) {
+		copy_urb_data_to_kernel(as->userbuffer, urb);
+	}
+        userurb->status = as->status;
+	userurb->actual_length = (int) urb->actual_length;
+	userurb->error_count = urb->error_count;
+
+	if (usb_endpoint_xfer_isoc(&urb->ep->desc)) {
+		for (i = 0; i < urb->number_of_packets; i++) {
+			userurb->iso_frame_desc[i].actual_length =
+				urb->iso_frame_desc[i].actual_length;
+			userurb->iso_frame_desc[i].status = (unsigned int)
+				urb->iso_frame_desc[i].status;
+		}
+	}
+
+	return 0;
+}
+//Charm end
+
 static struct async *reap_as(struct usb_dev_state *ps)
 {
 	DECLARE_WAITQUEUE(wait, current);
 	struct async *as = NULL;
 	struct usb_device *dev = ps->dev;
-
 	add_wait_queue(&ps->wait, &wait);
 	for (;;) {
 		__set_current_state(TASK_INTERRUPTIBLE);
@@ -1897,6 +2424,31 @@ static struct async *reap_as(struct usb_dev_state *ps)
 	set_current_state(TASK_RUNNING);
 	return as;
 }
+
+//Charm start
+static struct async *reap_as_single(struct usb_dev_state *ps, void __user *arg)
+{
+	DECLARE_WAITQUEUE(wait, current);
+	struct async *as = NULL;
+	struct usb_device *dev = ps->dev;
+
+	add_wait_queue(&ps->wait, &wait);
+	for (;!usbfs_charm_disconnect;) {
+		__set_current_state(TASK_INTERRUPTIBLE);
+		as = async_getcompleted_single(ps, arg);
+		if (as || !connected(ps))
+			break;
+		if (signal_pending(current))
+			break;
+		usb_unlock_device(dev);
+		schedule();
+		usb_lock_device(dev);
+	}
+	remove_wait_queue(&ps->wait, &wait);
+	set_current_state(TASK_RUNNING);
+	return as;
+}
+//Charm end
 
 static int proc_reapurb(struct usb_dev_state *ps, void __user *arg)
 {
@@ -1915,6 +2467,23 @@ static int proc_reapurb(struct usb_dev_state *ps, void __user *arg)
 	return -ENODEV;
 }
 
+//Charm start
+static int proc_reapurb_kernel(struct usb_dev_state *ps, void *arg)
+{
+	struct async *as = reap_as(ps);
+
+	if (as) {
+		int retval;
+
+		snoop(&ps->dev->dev, "reap %p\n", as->userurb);
+		retval = processcompl_kernel(as, (void **)arg);
+		free_async(as);
+		return retval;
+	}
+	return -ENODEV;
+}
+//Charm end
+
 static int proc_reapurbnonblock(struct usb_dev_state *ps, void __user *arg)
 {
 	int retval;
@@ -1930,6 +2499,40 @@ static int proc_reapurbnonblock(struct usb_dev_state *ps, void __user *arg)
 	}
 	return retval;
 }
+
+//Charm start
+static int proc_reapurbsingle(struct usb_dev_state *ps, void __user *arg)
+{
+	struct async *as = reap_as_single(ps, arg);
+
+	if (as) {
+		int retval;
+
+		snoop(&ps->dev->dev, "reap %p\n", as->userurb);
+		retval = processcompl_single(as);
+		free_async(as);
+		return retval;
+	}
+	if (signal_pending(current))
+		return -EINTR;
+	return -ENODEV;
+}
+
+static int proc_reapurbsingle_kernel(struct usb_dev_state *ps, void *arg)
+{
+	struct async *as = reap_as_single(ps, (void __user *) arg);
+
+	if (as) {
+		int retval;
+
+		snoop(&ps->dev->dev, "reap %p\n", as->userurb);
+		retval = processcompl_single_kernel(as);
+		free_async(as);
+		return retval;
+	}
+	return -ENODEV;
+}
+//Charm end
 
 #ifdef CONFIG_COMPAT
 static int proc_control_compat(struct usb_dev_state *ps,
@@ -2102,6 +2705,17 @@ static int proc_claiminterface(struct usb_dev_state *ps, void __user *arg)
 	return claimintf(ps, ifnum);
 }
 
+//Charm start
+static int proc_claiminterface_kernel(struct usb_dev_state *ps, void *arg)
+{
+	unsigned int ifnum;
+
+	ifnum = *((unsigned int *) arg);
+
+	return claimintf(ps, ifnum);
+}
+//Charm end
+
 static int proc_releaseinterface(struct usb_dev_state *ps, void __user *arg)
 {
 	unsigned int ifnum;
@@ -2115,6 +2729,21 @@ static int proc_releaseinterface(struct usb_dev_state *ps, void __user *arg)
 	destroy_async_on_interface(ps, ifnum);
 	return 0;
 }
+
+//Charm start
+static int proc_releaseinterface_kernel(struct usb_dev_state *ps, void *arg)
+{
+	unsigned int ifnum;
+	int ret;
+
+	ifnum = *((unsigned int *) arg);
+	ret = releaseintf(ps, ifnum);
+	if (ret < 0)
+		return ret;
+	destroy_async_on_interface(ps, ifnum);
+	return 0;
+}
+//Charm end
 
 static int proc_ioctl(struct usb_dev_state *ps, struct usbdevfs_ioctl *ctl)
 {
@@ -2131,8 +2760,9 @@ static int proc_ioctl(struct usb_dev_state *ps, struct usbdevfs_ioctl *ctl)
 	size = _IOC_SIZE(ctl->ioctl_code);
 	if (size > 0) {
 		buf = kmalloc(size, GFP_KERNEL);
-		if (buf == NULL)
+		if (buf == NULL){
 			return -ENOMEM;
+		}
 		if ((_IOC_DIR(ctl->ioctl_code) & _IOC_WRITE)) {
 			if (copy_from_user(buf, ctl->data, size)) {
 				kfree(buf);
@@ -2386,6 +3016,13 @@ static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
 		ret = proc_reapurbnonblock(ps, p);
 		goto done;
 
+	//Charm start
+	case USBDEVFS_REAPURBSINGLE:
+		snoop(&dev->dev, "%s: REAPURBSINGLE\n", __func__);
+		ret = proc_reapurbsingle(ps, p);
+		goto done;
+	//Charm end
+
 #ifdef CONFIG_COMPAT
 	case USBDEVFS_REAPURB32:
 		snoop(&dev->dev, "%s: REAPURB32\n", __func__);
@@ -2556,6 +3193,68 @@ static long usbdev_do_ioctl(struct file *file, unsigned int cmd,
 	return ret;
 }
 
+//Charm start
+static long usbdev_do_ioctl_kernel(struct file *file, unsigned int cmd,
+				   void *p)
+{
+	struct usb_dev_state *ps = file->private_data;
+	struct inode *inode = file_inode(file);
+	struct usb_device *dev = ps->dev;
+	int ret = -ENOTTY;
+
+	if (!(file->f_mode & FMODE_WRITE))
+		return -EPERM;
+
+	usb_lock_device(dev);
+
+	/* Reap operations are allowed even after disconnection */
+	switch (cmd) {
+	case USBDEVFS_REAPURB:
+		snoop(&dev->dev, "%s: REAPURB\n", __func__);
+		ret = proc_reapurb_kernel(ps, p);
+		goto done;
+
+	case USBDEVFS_REAPURBSINGLE:
+		snoop(&dev->dev, "%s: REAPURBSINGLE\n", __func__);
+		ret = proc_reapurbsingle_kernel(ps, p);
+		goto done;
+
+	}
+
+	if (!connected(ps)) {
+		usb_unlock_device(dev);
+		return -ENODEV;
+	}
+
+	switch (cmd) {
+
+	case USBDEVFS_SUBMITURB:
+		snoop(&dev->dev, "%s: SUBMITURB\n", __func__);
+		ret = proc_submiturb_kernel(ps, p);
+		if (ret >= 0)
+			inode->i_mtime = current_time(inode);
+		break;
+
+	case USBDEVFS_CLAIMINTERFACE:
+		snoop(&dev->dev, "%s: CLAIMINTERFACE\n", __func__);
+		ret = proc_claiminterface_kernel(ps, p);
+		break;
+
+	case USBDEVFS_RELEASEINTERFACE:
+		snoop(&dev->dev, "%s: RELEASEINTERFACE\n", __func__);
+		ret = proc_releaseinterface_kernel(ps, p);
+		break;
+
+	}
+
+ done:
+	usb_unlock_device(dev);
+	if (ret >= 0)
+		inode->i_atime = current_time(inode);
+	return ret;
+}
+//Charm end
+
 static long usbdev_ioctl(struct file *file, unsigned int cmd,
 			unsigned long arg)
 {
@@ -2565,6 +3264,19 @@ static long usbdev_ioctl(struct file *file, unsigned int cmd,
 
 	return ret;
 }
+
+//Charm start
+long usbdev_ioctl_kernel(struct file *file, unsigned int cmd,
+			unsigned long arg)
+{
+	int ret;
+
+	ret = usbdev_do_ioctl_kernel(file, cmd, (void *) arg);
+
+	return ret;
+}
+EXPORT_SYMBOL(usbdev_ioctl_kernel);
+//Charm end
 
 #ifdef CONFIG_COMPAT
 static long usbdev_compat_ioctl(struct file *file, unsigned int cmd,

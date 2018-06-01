@@ -55,6 +55,128 @@
 #include <asm/ioctl.h>
 #include <linux/uaccess.h>
 #include <asm/pgtable.h>
+//Charm start
+#include <linux/prints.h>
+#include <linux/string.h>
+
+#include <linux/socket.h>
+#include <linux/net.h>
+#include <linux/in.h>
+#include <net/sock.h>
+#include <linux/kthread.h>
+
+
+#include <linux/delay.h>
+#include <linux/kernel.h>
+
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/fs.h>
+
+#define PAYLOAD_SIZE 17
+
+#define READB_OPCODE 1
+#define READW_OPCODE 2
+#define READL_OPCODE 3
+#define READQ_OPCODE 4
+#define WRITEB_OPCODE 6
+#define WRITEW_OPCODE 7
+#define WRITEL_OPCODE 8
+#define WRITEQ_OPCODE 9
+
+#define RPC_PAYLOAD 256
+//Charm for record and replaya
+#define RR_REG_WR 0
+#define RR_RPC 1
+#define RR_IRQ 2
+#define MAX_RR_INDEX 10000
+
+
+
+struct rpc_data_struct{
+	uint8_t rpc_payload[RPC_PAYLOAD];
+	uint64_t rpc_response;
+};
+struct reg_rw_data_struct{
+	uint8_t	 upcode;
+	bool is_read;
+	uint64_t address;	
+	uint64_t to_write_val;
+	uint64_t read_val;
+};
+
+struct rr_data_struct{
+	uint8_t type;
+	struct reg_rw_data_struct reg_rw_data;
+	struct rpc_data_struct rpc_data;
+	uint64_t irq_num;
+};
+
+struct rr_data_struct * rr_data;
+struct mutex rr_lock;
+unsigned int rr_index=0;
+unsigned int rr_replay_max_index=0;
+bool record_started= false;
+bool replay_started= false;
+
+
+static struct kobject *rr_kobject;
+static int rr_dummy=1371;
+static ssize_t rr_show(struct kobject *kobj, struct kobj_attribute *attr,
+                      char *buf)
+{
+        return sprintf(buf, "%d\n", rr_dummy);
+}
+
+static ssize_t rr_print(struct kobject *kobj, struct kobj_attribute *attr,
+                      const char *buf, size_t count)
+{
+	if(buf[0]=='0'){
+		PRINTK7("\nRR STARTED\n");
+		mutex_init(&rr_lock);
+		rr_data = kmalloc( MAX_RR_INDEX *sizeof(struct rr_data_struct),GFP_KERNEL);
+		rr_index=0;
+		record_started=true;	
+		replay_started=false;	
+        	return count;
+	}
+	if(buf[0]=='1'){
+		PRINTK7("\nRR RESET\n");
+		mutex_init(&rr_lock);
+		rr_index=0;
+		record_started=false;	
+		replay_started=false;	
+        	return count;
+	}
+	if(buf[0]=='2'){
+		PRINTK7("\nRR REPLAY\n");
+		mutex_init(&rr_lock);
+		rr_replay_max_index=rr_index;
+		rr_index=0;
+		record_started=false;
+		replay_started=true;	
+        	return count;
+	}
+        return count;
+}
+static struct kobj_attribute rr_attribute =__ATTR(rr_dummy, 0660, rr_show,rr_print);
+
+/* From transport_usb.cpp in the adb source code. */
+static int charm_init(struct kvm *kvm);
+int is_charm_interface(int vid, int pid, int usb_class, int usb_subclass, int usb_protocol);
+int charm_init_usb_connection(struct kvm* kvm);
+static int usb_bulk_write(struct usb_handle *h, const void *data, int len);
+int usb_write(struct usb_handle *h, const void *_data, int len);
+int usb_write_2(struct usb_handle *h, const void *_data, int len);
+static int usb_bulk_read(struct usb_handle *h, void *data, int len);
+int usb_read(struct usb_handle *h, void *_data, int len);
+int usb_read_2(struct usb_handle *h, void *_data, int len);
+int usb_read_3(struct usb_handle *h, void *_data, int len);
+
+static inline unsigned int charm_xlate(unsigned int arm_irq );
+static inline int charm_inject_interrupt(struct kvm *kvm, int irq_num);
+int charm_irq_counter=0;
+//Charm end
 
 #include "coalesced_mmio.h"
 #include "async_pf.h"
@@ -716,7 +838,32 @@ static void kvm_destroy_vm(struct kvm *kvm)
 {
 	int i;
 	struct mm_struct *mm = kvm->mm;
+//Charm start	
+	struct task_struct *task;
+	struct list_head *list;
 
+
+	if (kvm->irq_thread)
+		kvm->charm_irq->is_vm_running = false;
+
+	if(kvm->irq_thread){
+		PRINTK5("kvm->irq_thread children\n");
+		list_for_each(list, &kvm->irq_thread->children) {
+			  task = list_entry(list, struct task_struct, sibling);
+			    /* task now points to one of current’s children */
+			  PRINTK5("child pid=%d\n",(int)task->pid);
+			  force_sig(SIGKILL,task);
+		}
+		force_sig(SIGKILL, kvm->irq_thread );	
+	}	
+
+	list_for_each(list, &current->children) {
+		  task = list_entry(list, struct task_struct, sibling);
+		    /* task now points to one of current’s children */
+		  PRINTK5("child pid=%d\n",(int)task->pid);
+		  force_sig(SIGKILL,task);
+	}
+//Charm end
 	kvm_destroy_vm_debugfs(kvm);
 	kvm_arch_sync_events(kvm);
 	spin_lock(&kvm_lock);
@@ -1086,6 +1233,13 @@ EXPORT_SYMBOL_GPL(kvm_set_memory_region);
 static int kvm_vm_ioctl_set_memory_region(struct kvm *kvm,
 					  struct kvm_userspace_memory_region *mem)
 {
+	//Charm start
+	PRINTK0("[1]: mem->slot = %#lx\n", (unsigned long) mem->slot); 
+	PRINTK0("[2]: mem->guest_phys_addr = %#lx\n", (unsigned long) mem->guest_phys_addr); 
+	PRINTK0("[3]: mem->memory_size = %#lx\n", (unsigned long) mem->memory_size); 
+	PRINTK0("[4]: mem->userspace_addr = %#lx\n", (unsigned long) mem->userspace_addr); 
+	PRINTK0("[5]: mem->flags = %#lx\n", (unsigned long) mem->flags); 
+	//Charm end
 	if ((u16)mem->slot >= KVM_USER_MEM_SLOTS)
 		return -EINVAL;
 
@@ -2523,7 +2677,8 @@ static int kvm_vcpu_ioctl_set_sigmask(struct kvm_vcpu *vcpu, sigset_t *sigset)
 		vcpu->sigset_active = 0;
 	return 0;
 }
-
+//Charm
+#define USB_FILE_NAME_RECEIVED 6666
 static long kvm_vcpu_ioctl(struct file *filp,
 			   unsigned int ioctl, unsigned long arg)
 {
@@ -2716,6 +2871,25 @@ out_free1:
 		}
 		r = kvm_arch_vcpu_ioctl_set_fpu(vcpu, fpu);
 		break;
+	}
+//Charm start
+	case KVM_CHARM_PASS_DEVNAME:{
+		struct kvm * kvm= vcpu->kvm;	
+		struct kvm_usb_devname my_kvm_usb_devname;
+		int ret;
+		char * argu;
+		char * name;
+		char * port;
+		char aport[128];
+		const char s[2] = ",";
+		argu = (char *)kmalloc(128,GFP_KERNEL);
+		copy_from_user(&my_kvm_usb_devname,argp,sizeof(my_kvm_usb_devname));
+		strcpy(argu,my_kvm_usb_devname.dev_name);
+		strcpy(kvm->usb_devname,argu);
+		charm_init(kvm);
+		break;
+//Charm end			
+	
 	}
 	default:
 		r = kvm_arch_vcpu_ioctl(filp, ioctl, arg);
@@ -3165,6 +3339,447 @@ static struct file_operations kvm_vm_fops = {
 #endif
 	.llseek		= noop_llseek,
 };
+
+//Charm start
+struct kvm_page_track_notifier_node charm_track_node;
+
+/* based on kvmgt_write_protect_add */
+static int charm_read_write_protect_page(struct kvm *kvm, u64 gfn)
+{
+	struct kvm_memory_slot *slot;
+	int idx;
+
+	idx = srcu_read_lock(&kvm->srcu);
+	slot = gfn_to_memslot(kvm, gfn);
+	if (!slot) {
+		PRINTK5("ERROR slot not find");
+		srcu_read_unlock(&kvm->srcu, idx);
+		return -EINVAL;
+	}
+
+	spin_lock(&kvm->mmu_lock);
+
+	kvm_slot_page_track_add_page(kvm, slot, gfn, KVM_PAGE_TRACK_READ_WRITE);
+
+	spin_unlock(&kvm->mmu_lock);
+	srcu_read_unlock(&kvm->srcu, idx);
+	return 0;
+}
+
+static void charm_track_read_write(struct kvm_vcpu *vcpu, gpa_t gpa,
+		const u8 *val, int len, bool is_read,
+		struct kvm_page_track_notifier_node *node)
+{
+        char send_buf[PAYLOAD_SIZE];
+	char opcode=0;
+	int offset=0;
+	uint64_t response_value;
+	uint64_t to_write_val;
+	if(vcpu->kvm->problem_detected==1){
+		PRINTK_ERR("PROBLEM DETECTED [1]");
+		*((u64 *) val) = 0;
+		return;
+	}
+        kernel_sigaction(SIGKILL, (__force __sighandler_t)2);
+
+	if(is_read){
+		switch(len){
+		case 1:
+			opcode=READB_OPCODE;
+		break;
+
+		case 2:
+			opcode=READW_OPCODE;
+		break;
+
+		case 4:
+			opcode=READL_OPCODE;
+		break;
+
+		case 8:
+			opcode=READQ_OPCODE;
+		break;
+		
+		default:
+		break;
+
+		}
+	}	
+	else{
+	
+		switch(len){
+		case 1:
+			opcode=WRITEB_OPCODE;
+		break;
+
+		case 2:
+			opcode=WRITEW_OPCODE;
+		break;
+
+		case 4:
+			opcode=WRITEL_OPCODE;
+		break;
+
+		case 8:
+			opcode=WRITEQ_OPCODE;
+		break;
+		
+		default:
+		break;
+		}
+		
+	}
+	//Charm for spi sensor device
+	if((gpa&0xffff0000)==0xf4d30000){
+		gpa= (0x14d30000)|(gpa&(0x0000ffff));
+	}
+
+	memcpy(send_buf+offset,&opcode,sizeof(char));
+	offset+=sizeof(char);
+	memcpy(send_buf+offset,&gpa, sizeof(uint64_t));	
+	offset+=sizeof(uint64_t);
+	memcpy(send_buf+offset,val, sizeof(uint64_t));
+	//Charm record and replay: replay start
+		memcpy(&to_write_val ,val, sizeof(uint64_t));
+		if(replay_started==true){
+			mutex_lock(&rr_lock);
+			if(rr_index>rr_replay_max_index){
+					PRINTK_ERR("!!!replay failed; more request than recorded!!!\n");
+					return ;
+			}
+			if (rr_data[rr_index].type!=RR_REG_WR){
+					PRINTK_ERR("!!!replay failed; unexpected reg_rw!!!\n");
+					return ;
+			}
+			if(opcode!=rr_data[rr_index].reg_rw_data.upcode){
+				PRINTK_ERR("!!!replay failed; unexpected reg_rw opcode!!!\n");
+				return ;
+			}
+			if(gpa!=rr_data[rr_index].reg_rw_data.address){
+				PRINTK_ERR("!!!replay failed; unexpected reg_rw address!!!\n");
+				return ;
+			}
+			if(rr_data[rr_index].reg_rw_data.is_read==false){
+				if(to_write_val!=rr_data[rr_index].reg_rw_data.to_write_val){
+					PRINTK_ERR("!!!replay failed; unexpected reg_rw to write val!!!\n");
+					return ;
+				}
+				PRINTK_ERR("reg_write replayed rr_index=%d",rr_index);
+			}else{
+
+				*((u64 *) val) = rr_data[rr_index].reg_rw_data.read_val;
+				PRINTK_ERR("reg_read replayed rr_index=%d",rr_index);
+			}
+			rr_index+=1;
+			if(rr_data[rr_index].type==RR_IRQ){
+				charm_inject_interrupt(vcpu->kvm,(int)rr_data[rr_index].irq_num);
+				PRINTK_ERR("irq replayed rr_index=%d",rr_index);
+				rr_index+=1;
+			}
+			mutex_unlock(&rr_lock);
+			return 0;
+		}
+
+	//Charm for record and replay: replay end
+
+//usb send and recv
+
+	if (is_read)
+		mutex_lock(&(vcpu->kvm->usb_handle.mlock));
+
+	usb_write(&(vcpu->kvm->usb_handle),(const void *)send_buf,PAYLOAD_SIZE);
+	if (is_read) {
+		usb_read(&(vcpu->kvm->usb_handle),(void *)&response_value,8);	
+		*((u64 *) val) = response_value;
+		mutex_unlock(&(vcpu->kvm->usb_handle.mlock));
+	}
+//Charm : record
+	if(record_started==true){
+		mutex_lock(&rr_lock);
+		rr_data[rr_index].type = RR_REG_WR;
+		rr_data[rr_index].reg_rw_data.upcode = opcode;
+		rr_data[rr_index].reg_rw_data.is_read = is_read;
+		memcpy(&rr_data[rr_index].reg_rw_data.address, &gpa ,sizeof(uint64_t)); 
+		memcpy(&rr_data[rr_index].reg_rw_data.to_write_val, &to_write_val ,sizeof(uint64_t)); 
+		memcpy(&rr_data[rr_index].reg_rw_data.read_val,&response_value  ,sizeof(uint64_t)); 
+		PRINTK6("reg_rw recorded rr_index=%d",rr_index);
+		rr_index+=1;	
+		mutex_unlock(&rr_lock);
+	}	
+}
+#define RPC_HYPERCALL 1
+#define PAGE_TRACK_HYPERCALL 2
+#define EARLY_DEBUG_HYPERCALL 3
+
+#define RR_INIT_HYPERCALL 4
+#define RR_RESET_HYPERCALL 5
+#define RR_REPLAY_HYPERCALL 6
+
+#define IRQ_SOURCE_ID KVM_USERSPACE_IRQ_SOURCE_ID
+
+int kvm_charm_hypercall(struct kvm_vcpu *vcpu, unsigned long arg1, unsigned long arg2,
+					       unsigned long arg3, unsigned long arg4)
+{
+	int ret;
+	char buffer[RPC_PAYLOAD];
+	uint64_t response_value;
+	int i=0;
+	if(vcpu->kvm->problem_detected==1){
+		PRINTK_ERR("PROBLEM DETECTED [2]");
+		return 0;
+	}
+        kernel_sigaction(SIGKILL, (__force __sighandler_t)2);
+
+	switch(arg1){
+	case(PAGE_TRACK_HYPERCALL):
+	
+		ret = charm_read_write_protect_page(vcpu->kvm, (u64) arg4);
+
+		for (i=0;i<128;i++){
+			 ret = kvm_set_irq(vcpu->kvm,IRQ_SOURCE_ID,i, 0,  false);
+		}
+		return 0;
+	break;
+	case(RPC_HYPERCALL):
+		kvm_read_guest( vcpu->kvm, (gpa_t) arg2 , (void *)buffer ,arg3 );
+	//Charm for record and replay: replay start
+		int i=0;
+		uint64_t rpc_opcode;
+		uint64_t rpc_opcode_recorded;
+		if(replay_started==true){
+			mutex_lock(&rr_lock);
+			if(rr_index>rr_replay_max_index){
+					PRINTK_ERR("!!!replay failed; more request than recorded!!!\n");
+					return 0;
+			}
+			if (rr_data[rr_index].type!=RR_RPC){
+					PRINTK_ERR("!!!replay failed; unexpected rpc!!!\n");
+					return 0;
+			}
+			memcpy(&rpc_opcode, (void *)buffer ,sizeof(rpc_opcode) ); 
+			memcpy(&rpc_opcode_recorded, (void *)rr_data[rr_index].rpc_data.rpc_payload ,sizeof(rpc_opcode) ); 
+			if(rpc_opcode!=rpc_opcode_recorded){
+				PRINTK_ERR("!!!replay failed; unexpected rpc payload!!! rr_index=%d,rpc_opcode=%d,rpc_opcode_recorded=%d\n",rr_index,(int)rpc_opcode,(int)rpc_opcode_recorded);
+				return 0;
+			}
+			kvm_write_guest( vcpu->kvm, (gpa_t)arg4 , (void *)(&rr_data[rr_index].rpc_data.rpc_response) , sizeof(response_value));	
+			PRINTK6("rpc replayed rr_index=%d",rr_index);
+			rr_index+=1;
+			if(rr_data[rr_index].type==RR_IRQ){
+				charm_inject_interrupt(vcpu->kvm,(int)rr_data[rr_index].irq_num);
+				PRINTK_ERR("irq replayed rr_index=%d",rr_index);
+				rr_index+=1;
+			}
+			mutex_unlock(&rr_lock);
+			return 0;
+		}
+
+	//Charm for record and replay: replay end
+		mutex_lock(&(vcpu->kvm->usb_handle.mlock_2));
+		usb_write_2(&(vcpu->kvm->usb_handle),(const void *)buffer,RPC_PAYLOAD);
+		usb_read_2(&(vcpu->kvm->usb_handle),(void *)&response_value,sizeof(uint64_t));
+		mutex_unlock(&(vcpu->kvm->usb_handle.mlock_2));
+		kvm_write_guest( vcpu->kvm, (gpa_t)arg4 , (void *)(&response_value) , sizeof(response_value));	
+	//Charm for record and replay: record start
+		if(record_started==true){
+			mutex_lock(&rr_lock);
+			rr_data[rr_index].type = RR_RPC;
+			memcpy(&rr_data[rr_index].rpc_data.rpc_payload, (void *)buffer ,RPC_PAYLOAD ); 
+			memcpy(&rr_data[rr_index].rpc_data.rpc_response,(void *)(&response_value) , sizeof(response_value)); 
+			rr_index+=1;
+			PRINTK6("rpc recorded rr_index=%d",rr_index);
+			mutex_unlock(&rr_lock);
+		}
+
+	//Charm for record and replay: record end
+		return 0;
+	break;
+	case(EARLY_DEBUG_HYPERCALL):
+		PRINTK4("KVM:charm:EARLY_DEBUG_HYPERCALL:: arg1 = %lu, arg2 = %lu, arg3 = %lu, arg4 = %#lx\n",
+							arg1, arg2, arg3, arg4);
+	break;
+//Charm for record and replay
+	case(RR_INIT_HYPERCALL):
+		PRINTK6("\nRR STARTED\n");
+		mutex_init(&rr_lock);
+		rr_data = kmalloc( MAX_RR_INDEX *sizeof(struct rr_data_struct),GFP_KERNEL);
+		rr_index=0;
+		record_started=true;	
+		replay_started=false;	
+	break;
+	case(RR_RESET_HYPERCALL):
+		PRINTK6("\nRR RESET\n");
+		mutex_init(&rr_lock);
+		rr_index=0;
+		record_started=false;	
+		replay_started=false;	
+	break;
+	case(RR_REPLAY_HYPERCALL):
+		PRINTK6("\nRR REPLAY\n");
+		mutex_init(&rr_lock);
+		rr_replay_max_index=rr_index;
+		rr_index=0;
+		record_started=false;
+		replay_started=true;	
+	break;
+	default:
+		printk(KERN_ALERT "%s: invalid hypercall code\n",__func__);
+		return EINVAL;
+	break;
+
+
+
+	}
+
+	return 0;
+}
+static inline unsigned int charm_xlate(unsigned int arm_irq )
+{
+        unsigned int ioapic_irq;
+        switch (arm_irq){
+	//translation for camera driver modules irq	
+        case 336:
+                ioapic_irq=127;
+        break;
+	case 222:
+		ioapic_irq=126;
+	break;
+	//translation for auido driver modules irq	
+	case 195:
+		ioapic_irq=119;
+	break;
+	case 196:
+		ioapic_irq=118;
+	break;
+	case 502:
+		ioapic_irq=72;
+	break;
+	//translation for GPU driver modules irq	
+	case 215:
+		ioapic_irq=80;
+	break;
+	case 261: /* 0x105 */
+		ioapic_irq=81;
+	break;
+	//sensor	
+	case 481: /* 0x105 */
+		ioapic_irq=85;
+	break;
+	default:
+		ioapic_irq=arm_irq;
+	break;
+
+        }
+	return ioapic_irq;
+
+}
+static inline int charm_inject_interrupt(struct kvm *kvm, int irq_num)
+{
+	int irq_return1, irq_return2;
+	int irq_return0;
+	irq_return0 = kvm_set_irq(kvm,IRQ_SOURCE_ID, irq_num, 0, false);
+	irq_return1 = kvm_set_irq(kvm,IRQ_SOURCE_ID, irq_num, 1, false);
+	irq_return2 = kvm_set_irq(kvm,IRQ_SOURCE_ID,irq_num, 0,  false);
+	if((irq_return2 <= 0)||(irq_return1<=0))
+		return -1;
+	return 0;
+}
+
+static int irq_thread_main(void *data)
+{
+	struct charm_irq_struct *charm_irq = (struct charm_irq_struct *) data;	
+	struct kvm *kvm= charm_irq->kvm;	
+	struct usb_handle handle, *handle_p;
+	uint64_t irq_arm;
+	unsigned int x86_irq;
+	int ret;
+	int ret2;
+	int last_read_ret=0;
+	struct inode *inode;
+
+	handle_p = &handle;
+	memcpy(handle_p, &kvm->usb_handle, sizeof(*handle_p));
+	inode = kvm->inode;
+
+	set_user_nice(current, -20);
+
+	kernel_sigaction(SIGKILL, (__force __sighandler_t)2);
+	while (!signal_pending(current)){
+		if(last_read_ret==0){
+			ret = usb_read_3(handle_p,&irq_arm,sizeof(uint64_t) );
+			if (ret==0) {
+				charm_irq_counter+=1;
+				x86_irq = charm_xlate(irq_arm);
+				if (charm_irq->is_vm_running) {
+					ret2 = charm_inject_interrupt(kvm,(int)x86_irq);	
+				//Charm for record and replay start
+					if(record_started==true){
+						mutex_lock(&rr_lock);
+						rr_data[rr_index].type=RR_IRQ;
+						rr_data[rr_index].irq_num = (int)x86_irq;
+						rr_index+=1;
+						PRINTK6("irq recorded rr_index=%d",rr_index);
+						mutex_unlock(&rr_lock);
+					}	
+				//Charm for record and replay end
+					if(ret2<0){
+						PRINTK_ERR("[1]WARNING Could not inject an interrupt");
+					}
+				}
+			}else{
+				PRINTK_ERR("[2]exit from irq loop");
+				last_read_ret=ret;
+			}
+		}else{
+			
+			PRINTK_ERR("[3]exit from irq loop");
+			if (charm_irq->is_vm_running) {
+				kvm->problem_detected=1;
+				kvm->irq_thread=NULL;
+			}
+			kfree(charm_irq);
+			do_exit(0);
+			return 0;
+		}
+	}
+	PRINTK_ERR("[4]exit from irq loop");
+	if (charm_irq->is_vm_running) {
+		kvm->problem_detected=1;
+		kvm->irq_thread=NULL;
+	}
+	kfree(charm_irq);
+	do_exit(0);
+	return 0;
+}
+
+/* based on kvmgt_guest_init */
+static int charm_init(struct kvm *kvm)
+{
+	int i,ret;
+	charm_irq_counter=0;
+	kvm->problem_detected=0;
+ 	charm_init_usb_connection(kvm);
+
+	struct charm_irq_struct *charm_irq;
+       
+	charm_irq = kmalloc(sizeof(*charm_irq), GFP_KERNEL);
+	if (!charm_irq) {
+		PRINTK_ERR("Could not allocate memory for charm_irq\n");
+		return -ENOMEM;
+	}
+	
+	charm_irq->kvm = kvm;
+	charm_irq->is_vm_running = true;
+	kvm->charm_irq = charm_irq;
+
+	kvm->irq_thread = kthread_run(irq_thread_main, (void*) charm_irq, "charm_irq_thread");
+
+	charm_track_node.track_read_write = charm_track_read_write;
+	kvm_page_track_register_notifier(kvm, &charm_track_node);
+
+	return 0;
+}
+//Charm end
 
 static int kvm_dev_ioctl_create_vm(unsigned long type)
 {
@@ -3924,12 +4539,632 @@ static void kvm_sched_out(struct preempt_notifier *pn,
 	kvm_arch_vcpu_put(vcpu);
 }
 
+
+//Charm start
+/* From transport_usb.cpp in the adb source code. */
+int is_charm_interface(int vid, int pid, int usb_class, int usb_subclass, int usb_protocol)
+{
+    return (usb_class == CHARM_CLASS && usb_subclass == CHARM_SUBCLASS && usb_protocol == CHARM_PROTOCOL);
+}
+/*
+ * Partly based on find_usb_device() and register_device() in usb_linux.cpp
+ * in the adb source code.
+ */
+
+#define CHARM_USB_NUM_WORKS	100
+
+struct charm_usb_work_struct {
+	struct usbdevfs_urb urb;
+	struct file *file;
+	struct work_struct work;
+};
+
+static void charm_usb_reap_write(struct work_struct *work)
+{
+	struct charm_usb_work_struct *charm_work =
+		container_of(work, struct charm_usb_work_struct, work);
+	struct usbdevfs_urb *urb;
+	struct file *file;
+	int res = -1;
+
+	if (charm_work == NULL) {
+		PRINTK_ERR("Error: charm_work is NULL\n");
+		return;
+	}
+
+
+	file = charm_work->file;
+	if (file == NULL) {
+		PRINTK_ERR("Error: file is NULL\n");
+		kfree(charm_work);
+		return;
+	}
+
+	urb = &charm_work->urb;
+
+	while (res < 0) {
+        	res = usbdev_ioctl_kernel(file, USBDEVFS_REAPURBSINGLE, urb);
+	}
+
+	kfree(charm_work);
+}
+
+int charm_init_usb_connection(struct kvm* kvm)
+{
+    unsigned char local_ep_in, local_ep_out;
+    unsigned char devdesc[4096];
+    unsigned char* bufptr = devdesc;
+    unsigned char* bufend;
+    struct usb_device_descriptor* device;
+    struct usb_config_descriptor* config;
+    struct usb_interface_descriptor* interface;
+    struct usb_endpoint_descriptor *ep1, *ep2, *ep3, *ep4, *ep5;
+    unsigned zero_mask = 0;
+    unsigned vid, pid;
+    ssize_t desclength;
+    int ret = -1;
+    loff_t pos = 0;
+//kvm usb related data init
+	kvm->file_opened=false;
+	kvm->interface_claimed=false;
+//
+	
+    if (kvm->usb_connection_initialized)
+        return 0;
+    kvm->usb_connection_initialized = true;
+
+
+
+    kvm->usb_handle.file = NULL;
+    kvm->usb_handle.fd = sys_open_kernel((char __user *) kvm->usb_devname, O_RDWR | O_CLOEXEC, 0, &kvm->usb_handle.file);
+    if (kvm->usb_handle.fd < 0) {
+        PRINTK_ERR("could not open usb dev file (error = %d)\n", kvm->usb_handle.fd);
+        return -EFAULT;
+    }
+
+    if (!kvm->usb_handle.file) {
+        PRINTK_ERR("file is NULL\n");
+        return -EFAULT;
+    }
+    kvm->inode = kvm->usb_handle.file->f_path.dentry->d_inode;
+    kvm->file_opened = true;
+
+    //desclength = kvm->usb_handle.file->f_op->read(kvm->usb_handle.file, devdesc, sizeof(devdesc), &pos);
+    desclength = usbdev_read_kernel(kvm->usb_handle.file, devdesc, sizeof(devdesc), &pos);
+    bufend = bufptr + desclength;
+
+    // should have device and configuration descriptors, and atleast two endpoints
+    if (desclength < USB_DT_DEVICE_SIZE + USB_DT_CONFIG_SIZE) {
+        PRINTK_ERR("desclength %zu is too small\n", desclength);
+        kvm->usb_handle.file->f_op->release(kvm->inode, kvm->usb_handle.file);
+        return -EINVAL;
+    }
+
+    device = (struct usb_device_descriptor*) bufptr;
+    bufptr += USB_DT_DEVICE_SIZE;
+
+    if((device->bLength != USB_DT_DEVICE_SIZE) || (device->bDescriptorType != USB_DT_DEVICE)) {
+        kvm->usb_handle.file->f_op->release(kvm->inode, kvm->usb_handle.file);
+        return -EINVAL;
+    }
+
+    vid = device->idVendor;
+    pid = device->idProduct;
+
+    // should have config descriptor next
+    config = (struct usb_config_descriptor *) bufptr;
+    bufptr += USB_DT_CONFIG_SIZE;
+    if (config->bLength != USB_DT_CONFIG_SIZE || config->bDescriptorType != USB_DT_CONFIG) {
+        PRINTK_ERR("usb_config_descriptor not found\n");
+        kvm->usb_handle.file->f_op->release(kvm->inode, kvm->usb_handle.file);
+        return -EINVAL;
+    }
+
+    // loop through all the descriptors and look for the ADB interface
+    while (bufptr < bufend) {
+        unsigned char length = bufptr[0];
+        unsigned char type = bufptr[1];
+
+        if (type == USB_DT_INTERFACE) {
+            interface = (struct usb_interface_descriptor *) bufptr;
+            bufptr += length;
+
+            if (length != USB_DT_INTERFACE_SIZE) {
+                PRINTK_ERR("interface descriptor has wrong size\n");
+                break;
+            }
+
+
+            if (interface->bNumEndpoints == 5 &&
+                    is_charm_interface(vid, pid, interface->bInterfaceClass,
+                    interface->bInterfaceSubClass, interface->bInterfaceProtocol))  {
+
+                ep1 = (struct usb_endpoint_descriptor *) bufptr;
+                bufptr += USB_DT_ENDPOINT_SIZE;
+                // For USB 3.0 SuperSpeed devices, skip potential
+                // USB 3.0 SuperSpeed Endpoint Companion descriptor
+                if (bufptr + 2 <= devdesc + desclength &&
+                    bufptr[0] == USB_DT_SS_EP_COMP_SIZE &&
+                    bufptr[1] == USB_DT_SS_ENDPOINT_COMP) {
+                    bufptr += USB_DT_SS_EP_COMP_SIZE;
+                }
+                ep2 = (struct usb_endpoint_descriptor *) bufptr;
+                bufptr += USB_DT_ENDPOINT_SIZE;
+                if (bufptr + 2 <= devdesc + desclength &&
+                    bufptr[0] == USB_DT_SS_EP_COMP_SIZE &&
+                    bufptr[1] == USB_DT_SS_ENDPOINT_COMP) {
+                    bufptr += USB_DT_SS_EP_COMP_SIZE;
+                }
+		ep3 = (struct usb_endpoint_descriptor *) bufptr;
+                bufptr += USB_DT_ENDPOINT_SIZE;
+                if (bufptr + 2 <= devdesc + desclength &&
+                    bufptr[0] == USB_DT_SS_EP_COMP_SIZE &&
+                    bufptr[1] == USB_DT_SS_ENDPOINT_COMP) {
+                    bufptr += USB_DT_SS_EP_COMP_SIZE;
+                }
+		ep4 = (struct usb_endpoint_descriptor *) bufptr;
+                bufptr += USB_DT_ENDPOINT_SIZE;
+                if (bufptr + 2 <= devdesc + desclength &&
+                    bufptr[0] == USB_DT_SS_EP_COMP_SIZE &&
+                    bufptr[1] == USB_DT_SS_ENDPOINT_COMP) {
+                    bufptr += USB_DT_SS_EP_COMP_SIZE;
+                }
+		ep5 = (struct usb_endpoint_descriptor *) bufptr;
+                bufptr += USB_DT_ENDPOINT_SIZE;
+                if (bufptr + 2 <= devdesc + desclength &&
+                    bufptr[0] == USB_DT_SS_EP_COMP_SIZE &&
+                    bufptr[1] == USB_DT_SS_ENDPOINT_COMP) {
+                    bufptr += USB_DT_SS_EP_COMP_SIZE;
+                }
+
+                if (bufptr > devdesc + desclength ||
+                    ep1->bLength != USB_DT_ENDPOINT_SIZE ||
+                    ep1->bDescriptorType != USB_DT_ENDPOINT ||
+                    ep2->bLength != USB_DT_ENDPOINT_SIZE ||
+                    ep2->bDescriptorType != USB_DT_ENDPOINT) {
+                    PRINTK_ERR("endpoints not found\n");
+                    break;
+                }
+
+                // all endpoints should be bulk
+                if (ep1->bmAttributes != USB_ENDPOINT_XFER_BULK ||
+                    ep2->bmAttributes != USB_ENDPOINT_XFER_BULK ||
+                    ep3->bmAttributes != USB_ENDPOINT_XFER_BULK ||
+                    ep4->bmAttributes != USB_ENDPOINT_XFER_BULK ||
+                    ep5->bmAttributes != USB_ENDPOINT_XFER_BULK) {
+                    PRINTK_ERR("bulk endpoints not found\n");
+                    continue;
+                }
+
+		if (ep1->bEndpointAddress != 0x84 ||
+                    ep2->bEndpointAddress != 0x3 ||
+                    ep3->bEndpointAddress != 0x85 ||
+                    ep4->bEndpointAddress != 0x4 ||
+                    ep5->bEndpointAddress != 0x86) {
+                    PRINTK_ERR("endpoints addresses not what expected\n");
+                    continue;
+                }
+
+                ret = 0;
+
+                /* aproto 01 needs 0 termination */
+                if(interface->bInterfaceProtocol == 0x01) {
+                    zero_mask = ep1->wMaxPacketSize - 1;
+                }
+
+                kvm->usb_handle.zero_mask = zero_mask;
+                kvm->usb_handle.writeable = 1;
+                kvm->usb_handle.ep_in = ep1->bEndpointAddress;
+                kvm->usb_handle.ep_out = ep2->bEndpointAddress;
+                kvm->usb_handle.ep_in_2 = ep3->bEndpointAddress;
+                kvm->usb_handle.ep_out_2 = ep4->bEndpointAddress;
+                kvm->usb_handle.ep_in_3 = ep5->bEndpointAddress;
+                kvm->interface_num = interface->bInterfaceNumber;
+
+                ret = usbdev_ioctl_kernel(kvm->usb_handle.file,
+                                USBDEVFS_CLAIMINTERFACE, (unsigned long) &(kvm->interface_num));
+                if (ret) {
+                    PRINTK_ERR("[usb ioctl(USBDEVFS_CLAIMINTERFACE) "
+                                    "failed, ret = %d]\n", ret);
+                    kvm->usb_handle.file->f_op->release(kvm->inode, kvm->usb_handle.file);
+                }
+                kvm->interface_claimed = true;
+
+		mutex_init(&kvm->usb_handle.mlock);
+		mutex_init(&kvm->usb_handle.mlock_2);
+		spin_lock_init(&kvm->usb_handle.lock);
+		spin_lock_init(&kvm->usb_handle.lock_2);
+		spin_lock_init(&kvm->usb_handle.lock_3);
+
+		/* Note: the workqueue code was adopted from the Paradice project:
+		 * https://github.com/arrdalan/dfv_modules
+		 */
+		kvm->usb_handle.wq = alloc_workqueue("charm", WQ_HIGHPRI, CHARM_USB_NUM_WORKS);
+		if (!kvm->usb_handle.wq) {
+			PRINTK_ERR("Error: could not create workqueue.\n");
+			return -EFAULT;
+		}
+
+             }
+
+         } else {
+                    bufptr += length;
+         }
+    }
+
+    return ret;
+}
+/* Adopted and modified from usb_bulk_write() in usb_linux.cpp in the adb source code */
+static int usb_bulk_write(struct usb_handle *h, const void *data, int len)
+{
+    //struct usbdevfs_urb *urb = &h->urb_out;
+    struct usbdevfs_urb *urb;
+    int res;
+    struct charm_usb_work_struct *charm_work;
+
+    charm_work = kmalloc(sizeof(*charm_work), GFP_KERNEL);
+    if (charm_work == NULL) {
+        PRINTK_ERR("Could not allocate charm_work\n");
+        return -ENOMEM;
+    }
+
+    urb = &charm_work->urb;
+
+    memset(urb, 0, sizeof(*urb));
+    urb->type = USBDEVFS_URB_TYPE_BULK;
+    urb->endpoint = h->ep_out;
+    urb->status = -1;
+    urb->buffer = (void*) data;
+    urb->buffer_length = len;
+    spin_lock(&h->lock);
+    do {
+        res = usbdev_ioctl_kernel(h->file, USBDEVFS_SUBMITURB, urb);
+    } while (res == -EINTR);
+
+    if(res < 0) {
+        PRINTK_ERR("[usb ioctl(USBDEVFS_SUBMITURB) failed: error = %d]\n",
+                res);
+        goto fail;
+    }
+
+    /* reap urb asynchronously */
+    INIT_WORK(&charm_work->work, charm_usb_reap_write);
+    charm_work->file = h->file;
+    queue_work(h->wq, &charm_work->work); 
+fail:
+    spin_unlock(&h->lock);
+    return res;
+}
+
+/* Adopted and modified from usb_write() in usb_linux.cpp in the adb source code */
+int usb_write(struct usb_handle *h, const void *_data, int len)
+{
+    unsigned char *data = (unsigned char*) _data;
+    int n;
+    int need_zero = 0;
+    if(h->zero_mask) {
+            /* if we need 0-markers and our transfer
+            ** is an even multiple of the packet size,
+            ** we make note of it
+            */
+        if(!(len & h->zero_mask)) {
+            need_zero = 1;
+        }
+    }
+
+    while(len > 0) {
+        int xfer = (len > 4096) ? 4096 : len;
+
+        n = usb_bulk_write(h, data, xfer);
+        if(n < 0) {
+            return -1;
+        }
+
+        len -= xfer;
+        data += xfer;
+    }
+
+    if(need_zero){
+        n = usb_bulk_write(h, _data, 0);
+        return n;
+    }
+
+    return 0;
+}
+
+/* Adopted and modified from usb_bulk_write() in usb_linux.cpp in the adb source code */
+static int usb_bulk_write_2(struct usb_handle *h, const void *data, int len)
+{
+    struct usbdevfs_urb *urb;
+    int res;
+    struct charm_usb_work_struct *charm_work;
+
+    charm_work = kmalloc(sizeof(*charm_work), GFP_KERNEL);
+    if (charm_work == NULL) {
+        PRINTK_ERR("Could not allocate charm_work\n");
+        return -ENOMEM;
+    }
+
+    urb = &charm_work->urb;
+
+    memset(urb, 0, sizeof(*urb));
+    urb->type = USBDEVFS_URB_TYPE_BULK;
+    urb->endpoint = h->ep_out_2;
+    urb->status = -1;
+    urb->buffer = (void*) data;
+    urb->buffer_length = len;
+
+    spin_lock(&h->lock_2);
+    do {
+        res = usbdev_ioctl_kernel(h->file, USBDEVFS_SUBMITURB, urb);
+    } while (res == -EINTR);
+
+    if(res < 0) {
+        PRINTK_ERR("[usb ioctl(USBDEVFS_SUBMITURB) failed: error = %d]\n",
+                res);
+        goto fail;
+    }
+
+    /* reap urb asynchronously */
+    INIT_WORK(&charm_work->work, charm_usb_reap_write);
+    charm_work->file = h->file;
+    queue_work(h->wq, &charm_work->work);
+
+fail:
+    spin_unlock(&h->lock_2);
+    return res;
+}
+
+/* Adopted and modified from usb_write() in usb_linux.cpp in the adb source code */
+int usb_write_2(struct usb_handle *h, const void *_data, int len)
+{
+    unsigned char *data = (unsigned char*) _data;
+    int n;
+    int need_zero = 0;
+
+    if(h->zero_mask) {
+            /* if we need 0-markers and our transfer
+            ** is an even multiple of the packet size,
+            ** we make note of it
+            */
+        if(!(len & h->zero_mask)) {
+            need_zero = 1;
+        }
+    }
+
+    while(len > 0) {
+        int xfer = (len > 4096) ? 4096 : len;
+
+        n = usb_bulk_write_2(h, data, xfer);
+        if(n < 0) {
+            return -1;
+        }
+
+        len -= xfer;
+        data += xfer;
+    }
+
+    if(need_zero){
+        n = usb_bulk_write_2(h, _data, 0);
+        return n;
+    }
+
+    return 0;
+}
+
+/* Adopted and modified from usb_bulk_read() in usb_linux.cpp in the adb source code */
+static int usb_bulk_read(struct usb_handle *h, void *data, int len)
+{
+    struct usbdevfs_urb *urb = &h->urb_in;
+    int res;
+
+    memset(urb, 0, sizeof(*urb));
+    urb->type = USBDEVFS_URB_TYPE_BULK;
+    urb->endpoint = h->ep_in;
+    urb->status = -1;
+    urb->buffer = data;
+    urb->buffer_length = len;
+
+
+    spin_lock(&h->lock);
+    do {
+        res = usbdev_ioctl_kernel(h->file, USBDEVFS_SUBMITURB, urb);
+    } while(res == -EINTR);
+
+    if(res < 0) {
+        goto fail;
+    }
+
+    res = -1;
+    while (res < 0) {
+        spin_unlock(&h->lock);
+        res = usbdev_ioctl_kernel(h->file, USBDEVFS_REAPURBSINGLE, &h->urb_in);
+        spin_lock(&h->lock);
+    }
+    if(urb->status == 0) {
+        res = urb->actual_length;
+    }
+fail:
+    spin_unlock(&h->lock);
+    return res;
+}
+/* Adopted and modified from usb_read() in usb_linux.cpp in the adb source code */
+int usb_read(struct usb_handle *h, void *_data, int len)
+{
+    unsigned char *data = (unsigned char*) _data;
+    int n;
+    while(len > 0) {
+        int xfer = (len > 4096) ? 4096 : len;
+
+        n = usb_bulk_read(h, data, xfer);
+        if(n != xfer) {
+            if((n == -ETIMEDOUT) && (h->file != NULL)) {
+                if(n > 0){
+                    data += n;
+                    len -= n;
+                }
+                continue;
+            }
+            PRINTK_ERR("xfer = %d, n = %d\n", xfer, n);
+            return -1;
+        }
+
+        len -= xfer;
+        data += xfer;
+    }
+
+    return 0;
+}
+
+/* Adopted and modified from usb_bulk_read() in usb_linux.cpp in the adb source code */
+static int usb_bulk_read_2(struct usb_handle *h, void *data, int len)
+{
+    struct usbdevfs_urb *urb = &h->urb_in_2;
+    int res;
+
+    memset(urb, 0, sizeof(*urb));
+    urb->type = USBDEVFS_URB_TYPE_BULK;
+    urb->endpoint = h->ep_in_2;
+    urb->status = -1;
+    urb->buffer = data;
+    urb->buffer_length = len;
+
+    spin_lock(&h->lock_2);
+    do {
+        res = usbdev_ioctl_kernel(h->file, USBDEVFS_SUBMITURB, urb);
+    } while(res == -EINTR);
+
+    if(res < 0) {
+        goto fail;
+    }
+    res = -1;
+    while (res < 0) {
+        spin_unlock(&h->lock_2);
+        res = usbdev_ioctl_kernel(h->file, USBDEVFS_REAPURBSINGLE, &h->urb_in_2);
+        spin_lock(&h->lock_2);
+    }
+    if(urb->status == 0) {
+        res = urb->actual_length;
+    }
+fail:
+    spin_unlock(&h->lock_2);
+    return res;
+}
+/* Adopted and modified from usb_read() in usb_linux.cpp in the adb source code */
+int usb_read_2(struct usb_handle *h, void *_data, int len)
+{
+    unsigned char *data = (unsigned char*) _data;
+    int n;
+
+    while(len > 0) {
+        int xfer = (len > 4096) ? 4096 : len;
+
+        n = usb_bulk_read_2(h, data, xfer);
+        if(n != xfer) {
+            if((n == -ETIMEDOUT) && (h->file != NULL)) {
+                if(n > 0){
+                    data += n;
+                    len -= n;
+                }
+                continue;
+            }
+            PRINTK_ERR("xfer = %d, n = %d\n", xfer, n);
+            return -1;
+        }
+
+        len -= xfer;
+        data += xfer;
+    }
+
+    return 0;
+}
+
+/* Adopted and modified from usb_bulk_read() in usb_linux.cpp in the adb source code */
+static int usb_bulk_read_3(struct usb_handle *h, void *data, int len)
+{
+    struct usbdevfs_urb *urb = &h->urb_in_3;
+    int res;
+
+    memset(urb, 0, sizeof(*urb));
+    urb->type = USBDEVFS_URB_TYPE_BULK;
+    urb->endpoint = h->ep_in_3;
+    urb->status = -1;
+    urb->buffer = data;
+    urb->buffer_length = len;
+
+
+    spin_lock(&h->lock_3);
+    do {
+        res = usbdev_ioctl_kernel(h->file, USBDEVFS_SUBMITURB, urb);
+    } while(res == -EINTR);
+
+    if(res < 0) {
+        goto fail;
+    }
+
+    res = -1;
+    while (res < 0 && res != -ENODEV) {
+        spin_unlock(&h->lock_3);
+        res = usbdev_ioctl_kernel(h->file, USBDEVFS_REAPURBSINGLE, &h->urb_in_3);
+        spin_lock(&h->lock_3);
+    }
+    if(urb->status == 0) {
+        res = urb->actual_length;
+    }
+fail:
+    spin_unlock(&h->lock_3);
+    return res;
+}
+/* Adopted and modified from usb_read() in usb_linux.cpp in the adb source code */
+int usb_read_3(struct usb_handle *h, void *_data, int len)
+{
+    unsigned char *data = (unsigned char*) _data;
+    int n;
+
+    while(len > 0) {
+        int xfer = (len > 4096) ? 4096 : len;
+
+        n = usb_bulk_read_3(h, data, xfer);
+        if(n != xfer) {
+            if((n == -ETIMEDOUT) && (h->file != NULL)) {
+                if(n > 0){
+                    data += n;
+                    len -= n;
+                }
+                continue;
+            }
+            PRINTK_ERR("xfer = %d, n = %d\n", xfer, n);
+            return -1;
+        }
+
+        len -= xfer;
+        data += xfer;
+    }
+
+    return 0;
+}
+//Charm end
+
+
+
 int kvm_init(void *opaque, unsigned vcpu_size, unsigned vcpu_align,
 		  struct module *module)
 {
 	int r;
 	int cpu;
 
+//Charm for record and replay/
+	int error;
+	 rr_kobject = kobject_create_and_add("record_and_replay",
+                                                 kernel_kobj);
+        if(!rr_kobject)
+                return -ENOMEM;
+
+        error = sysfs_create_file(rr_kobject, &rr_attribute.attr);
+        if (error) {
+                pr_debug("failed to create the foo file in /sys/kernel/kobject_example \n");
+        }
+// Charm end  
 	r = kvm_arch_init(opaque);
 	if (r)
 		goto out_fail;
@@ -4034,6 +5269,12 @@ EXPORT_SYMBOL_GPL(kvm_init);
 
 void kvm_exit(void)
 {
+	
+//Charm for record and replay/
+         sysfs_remove_file(rr_kobject, &rr_attribute.attr);
+	 kobject_put(rr_kobject);
+//Charm end  
+
 	debugfs_remove_recursive(kvm_debugfs_dir);
 	misc_deregister(&kvm_dev);
 	kmem_cache_destroy(kvm_vcpu_cache);

@@ -14,6 +14,8 @@
  */
 
 #include <linux/kvm_host.h>
+//Charm
+#include <linux/prints.h>
 #include <asm/kvm_host.h>
 #include <asm/kvm_page_track.h>
 
@@ -105,6 +107,12 @@ void kvm_slot_page_track_add_page(struct kvm *kvm,
 	if (mode == KVM_PAGE_TRACK_WRITE)
 		if (kvm_mmu_slot_gfn_write_protect(kvm, slot, gfn))
 			kvm_flush_remote_tlbs(kvm);
+
+	//Charm start
+	if (mode == KVM_PAGE_TRACK_READ_WRITE)
+		if (kvm_mmu_slot_gfn_read_write_protect(kvm, slot, gfn))
+			kvm_flush_remote_tlbs(kvm);
+	//Charm end
 }
 EXPORT_SYMBOL_GPL(kvm_slot_page_track_add_page);
 
@@ -237,6 +245,27 @@ void kvm_page_track_write(struct kvm_vcpu *vcpu, gpa_t gpa, const u8 *new,
 			n->track_write(vcpu, gpa, new, bytes, n);
 	srcu_read_unlock(&head->track_srcu, idx);
 }
+
+//Charm start
+void kvm_page_track_read_write(struct kvm_vcpu *vcpu, gpa_t gpa, const u8 *val,
+			       int bytes, bool is_read)
+{
+	struct kvm_page_track_notifier_head *head;
+	struct kvm_page_track_notifier_node *n;
+	int idx;
+
+	head = &vcpu->kvm->arch.track_notifier_head;
+
+	if (hlist_empty(&head->track_notifier_list))
+		return;
+
+	idx = srcu_read_lock(&head->track_srcu);
+	hlist_for_each_entry_rcu(n, &head->track_notifier_list, node)
+		if (n->track_read_write)
+			n->track_read_write(vcpu, gpa, val, bytes, is_read, n);
+	srcu_read_unlock(&head->track_srcu, idx);
+}
+//Charm end
 
 /*
  * Notify the node that memory slot is being removed or moved so that it can

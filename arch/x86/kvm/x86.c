@@ -65,6 +65,8 @@
 #include <asm/pvclock.h>
 #include <asm/div64.h>
 #include <asm/irq_remapping.h>
+//Charm
+#include <linux/prints.h>
 
 #define CREATE_TRACE_POINTS
 #include "trace.h"
@@ -4051,7 +4053,8 @@ long kvm_arch_vm_ioctl(struct file *filp,
 	case KVM_SET_IRQCHIP: {
 		/* 0: PIC master, 1: PIC slave, 2: IOAPIC */
 		struct kvm_irqchip *chip;
-
+		//javad
+		PRINTK4("****I found it");
 		chip = memdup_user(argp, sizeof(*chip));
 		if (IS_ERR(chip)) {
 			r = PTR_ERR(chip);
@@ -4545,12 +4548,25 @@ static int read_prepare(struct kvm_vcpu *vcpu, void *val, int bytes)
 static int read_emulate(struct kvm_vcpu *vcpu, gpa_t gpa,
 			void *val, int bytes)
 {
+	//Charm start
+	if (kvm_page_track_is_active(vcpu, gpa >> PAGE_SHIFT, KVM_PAGE_TRACK_READ_WRITE)) {
+		kvm_page_track_read_write(vcpu, gpa, val, bytes, true);
+		return 1;
+	}
+	//Charm end
 	return !kvm_vcpu_read_guest(vcpu, gpa, val, bytes);
 }
 
 static int write_emulate(struct kvm_vcpu *vcpu, gpa_t gpa,
 			 void *val, int bytes)
 {
+	//Charm start
+	if (kvm_page_track_is_active(vcpu, gpa >> PAGE_SHIFT, KVM_PAGE_TRACK_READ_WRITE)) {
+		kvm_page_track_read_write(vcpu, gpa, val, bytes, false);
+		return 1;
+	}
+	//Charm end
+
 	return emulator_write_phys(vcpu, gpa, val, bytes);
 }
 
@@ -5404,7 +5420,8 @@ static bool retry_instruction(struct x86_emulate_ctxt *ctxt,
 	if (!(emulation_type & EMULTYPE_RETRY))
 		return false;
 
-	if (x86_page_table_writing_insn(ctxt))
+	//Charm: FIXME
+	////if (x86_page_table_writing_insn(ctxt))
 		return false;
 
 	if (ctxt->eip == last_retry_eip && last_retry_addr == cr2)
@@ -5675,7 +5692,6 @@ restart:
 			kvm_make_request(KVM_REQ_EVENT, vcpu);
 	} else
 		vcpu->arch.emulate_regs_need_sync_to_vcpu = true;
-
 	return r;
 }
 EXPORT_SYMBOL_GPL(x86_emulate_instruction);
@@ -6117,6 +6133,10 @@ void kvm_vcpu_deactivate_apicv(struct kvm_vcpu *vcpu)
 	kvm_x86_ops->refresh_apicv_exec_ctrl(vcpu);
 }
 
+//Charm: move to a header file
+int kvm_charm_hypercall(struct kvm_vcpu *vcpu, unsigned long arg1, unsigned long arg2,
+					       unsigned long arg3, unsigned long arg4);
+
 int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 {
 	unsigned long nr, a0, a1, a2, a3, ret;
@@ -6157,6 +6177,12 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		kvm_pv_kick_cpu_op(vcpu->kvm, a0, a1);
 		ret = 0;
 		break;
+	//Charm start
+	case KVM_HC_CHARM:
+		kvm_charm_hypercall(vcpu, a0, a1, a2, a3);
+		ret = 0;
+		break;
+	//Charm end
 	default:
 		ret = -KVM_ENOSYS;
 		break;

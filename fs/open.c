@@ -1040,6 +1040,52 @@ struct file *filp_clone_open(struct file *oldfile)
 }
 EXPORT_SYMBOL(filp_clone_open);
 
+//Charm start
+#include <linux/prints.h>
+
+static long do_sys_open_kernel(int dfd, const char *filename, int flags,
+			       int mode, struct file **_f)
+{
+	struct open_flags op;
+	int fd = build_open_flags(flags, mode, &op);
+	struct filename *tmp;
+
+	if (fd)
+		return fd;
+
+	tmp = getname_kernel(filename);
+	if (IS_ERR(tmp))
+		return PTR_ERR(tmp);
+
+	fd = get_unused_fd_flags(flags);
+	if (fd >= 0) {
+		struct file *f = do_filp_open(dfd, tmp, &op);
+		if (IS_ERR(f)) {
+			put_unused_fd(fd);
+			fd = PTR_ERR(f);
+		} else {
+			fsnotify_open(f);
+			fd_install(fd, f);
+			trace_do_sys_open(tmp->name, flags, mode);
+		}
+
+		*_f = f;
+	}
+	putname(tmp);
+	return fd;
+}
+
+long sys_open_kernel(const char *filename, int flags, int mode,
+							struct file **_f)
+{
+	if (force_o_largefile())
+		flags |= O_LARGEFILE;
+
+	return do_sys_open_kernel(AT_FDCWD, filename, flags, mode, _f);
+}
+EXPORT_SYMBOL(sys_open_kernel);
+//Charm end
+
 long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 {
 	struct open_flags op;

@@ -37,6 +37,8 @@
 #include <linux/srcu.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+//Charm
+#include <linux/prints.h>
 
 #include <asm/page.h>
 #include <asm/cmpxchg.h>
@@ -1224,6 +1226,26 @@ static bool spte_write_protect(u64 *sptep, bool pt_protect)
 	return mmu_spte_update(sptep, spte);
 }
 
+//Charm start
+static bool spte_read_write_protect(u64 *sptep, bool pt_protect)
+{
+	u64 spte = *sptep;
+
+	if (!is_writable_pte(spte) &&
+	      !(pt_protect && spte_is_locklessly_modifiable(spte)))
+		return false;
+
+	rmap_printk("rmap_read_write_protect: spte %p %llx\n", sptep, *sptep);
+
+	if (pt_protect)
+		spte &= ~SPTE_MMU_WRITEABLE;
+	spte = spte & ~PT_WRITABLE_MASK;
+	spte = spte & ~PT_PRESENT_MASK;
+
+	return mmu_spte_update(sptep, spte);
+}
+//Charm end
+
 static bool __rmap_write_protect(struct kvm *kvm,
 				 struct kvm_rmap_head *rmap_head,
 				 bool pt_protect)
@@ -1237,6 +1259,22 @@ static bool __rmap_write_protect(struct kvm *kvm,
 
 	return flush;
 }
+
+//Charm start
+static bool __rmap_read_write_protect(struct kvm *kvm,
+				 struct kvm_rmap_head *rmap_head,
+				 bool pt_protect)
+{
+	u64 *sptep;
+	struct rmap_iterator iter;
+	bool flush = false;
+
+	for_each_rmap_spte(rmap_head, &iter, sptep)
+		flush |= spte_read_write_protect(sptep, pt_protect);
+
+	return flush;
+}
+//Charm end
 
 static bool spte_clear_dirty(u64 *sptep)
 {
@@ -1371,6 +1409,23 @@ bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
 
 	return write_protected;
 }
+
+//Charm start
+bool kvm_mmu_slot_gfn_read_write_protect(struct kvm *kvm,
+				    struct kvm_memory_slot *slot, u64 gfn)
+{
+	struct kvm_rmap_head *rmap_head;
+	int i;
+	bool protected = false;
+
+	for (i = PT_PAGE_TABLE_LEVEL; i <= PT_MAX_HUGEPAGE_LEVEL; ++i) {
+		rmap_head = __gfn_to_rmap(gfn, i, slot);
+		protected |= __rmap_read_write_protect(kvm, rmap_head, true);
+	}
+
+	return protected;
+}
+//Charm end
 
 static bool rmap_write_protect(struct kvm_vcpu *vcpu, u64 gfn)
 {
@@ -3415,6 +3470,14 @@ static bool page_fault_handle_page_track(struct kvm_vcpu *vcpu,
 {
 	if (unlikely(error_code & PFERR_RSVD_MASK))
 		return false;
+	//Charm start
+	//PRINTK0("[2]: gfn = %#lx\n", (unsigned long) gfn);
+	//PRINTK0("[2.1]: !(error_code & PFERR_PRESENT_MASK) = %d\n", !(error_code & PFERR_PRESENT_MASK));
+	//PRINTK0("[2.2]: !(error_code & PFERR_WRITE_MASK) = %d\n", !(error_code & PFERR_WRITE_MASK));
+	//PRINTK0("[2.3]: !(error_code & PFERR_USER_MASK) = %d\n", !(error_code & PFERR_USER_MASK));
+	if (kvm_page_track_is_active(vcpu, gfn, KVM_PAGE_TRACK_READ_WRITE))
+		return true;
+	//Charm end
 
 	if (!(error_code & PFERR_PRESENT_MASK) ||
 	      !(error_code & PFERR_WRITE_MASK))

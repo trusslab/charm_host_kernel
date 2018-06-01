@@ -3,6 +3,8 @@
 
 enum kvm_page_track_mode {
 	KVM_PAGE_TRACK_WRITE,
+	//Charm
+	KVM_PAGE_TRACK_READ_WRITE,
 	KVM_PAGE_TRACK_MAX,
 };
 
@@ -43,6 +45,11 @@ struct kvm_page_track_notifier_node {
 	 */
 	void (*track_flush_slot)(struct kvm *kvm, struct kvm_memory_slot *slot,
 			    struct kvm_page_track_notifier_node *node);
+
+	//Charm start
+	void (*track_read_write)(struct kvm_vcpu *vcpu, gpa_t gpa, const u8 *val, int bytes,
+			    bool is_read, struct kvm_page_track_notifier_node *node);
+	//Charm end
 };
 
 void kvm_page_track_init(struct kvm *kvm);
@@ -71,4 +78,6 @@ kvm_page_track_unregister_notifier(struct kvm *kvm,
 void kvm_page_track_write(struct kvm_vcpu *vcpu, gpa_t gpa, const u8 *new,
 			  int bytes);
 void kvm_page_track_flush_slot(struct kvm *kvm, struct kvm_memory_slot *slot);
+void kvm_page_track_read_write(struct kvm_vcpu *vcpu, gpa_t gpa, const u8 *val,
+			       int bytes, bool is_read);
 #endif

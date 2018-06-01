@@ -35,6 +35,63 @@
 
 #include <asm/kvm_host.h>
 
+//Charm start
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/slab.h>
+#include <linux/usbdevice_fs.h>
+#include <linux/usb/ch9.h>
+#include <linux/prints.h>
+
+/* From adb.h in the adb source code. */
+#define CHARM_CLASS              0xff
+#define CHARM_SUBCLASS           0xff //0x42                                                
+#define CHARM_PROTOCOL           0x0 //0x1
+
+long sys_open_kernel(const char *filename, int flags, int mode,
+                                                         struct file **_f);
+ssize_t usbdev_read_kernel(struct file *file, char *buf, size_t nbytes,
+                            loff_t *ppos);
+long usbdev_ioctl_kernel(struct file *file, unsigned int cmd,
+                         unsigned long arg);
+
+
+
+/* Based on struct usb_handle in usb_linux.cpp in the adb source code. */
+struct usb_handle {
+
+	struct file *file;
+	int fd;
+	unsigned char ep_in;
+	unsigned char ep_out;
+	unsigned char ep_in_2;
+	unsigned char ep_out_2;
+	unsigned char ep_in_3;
+	
+	unsigned zero_mask;
+	unsigned writeable;
+	
+	struct usbdevfs_urb urb_in;
+	struct usbdevfs_urb urb_out;
+	struct usbdevfs_urb urb_in_2;
+	struct usbdevfs_urb urb_out_2;
+	struct usbdevfs_urb urb_in_3;
+	
+	int urb_in_busy;
+	int urb_out_busy;
+	int dead;
+	
+	struct mutex mlock;
+	struct mutex mlock_2;
+	spinlock_t lock;
+	spinlock_t lock_2;
+	spinlock_t lock_3;
+	
+	struct workqueue_struct *wq;
+};
+//Charm
+
 #ifndef KVM_MAX_VCPU_ID
 #define KVM_MAX_VCPU_ID KVM_MAX_VCPUS
 #endif
@@ -371,6 +428,13 @@ struct kvm_memslots {
 	int used_slots;
 };
 
+//Charm start
+struct charm_irq_struct {
+	struct kvm *kvm;
+	bool is_vm_running;
+};
+//Charm end
+
 struct kvm {
 	spinlock_t mmu_lock;
 	struct mutex slots_lock;
@@ -430,6 +494,23 @@ struct kvm {
 	struct list_head devices;
 	struct dentry *debugfs_dentry;
 	struct kvm_stat_data **debugfs_stat_data;
+
+//Charm start
+	char usb_devname[128];
+	struct usb_handle usb_handle;
+	bool file_opened;
+	bool interface_claimed;
+	int interface_num;
+	struct inode *inode;
+        bool usb_connection_initialized;
+	struct charm_irq_struct *charm_irq;
+	int charm_began;
+	int problem_detected;
+	int usb_filename_received;
+	unsigned long int irq_port;
+	struct task_struct *irq_thread;
+//Charm end
+
 };
 
 #define kvm_err(fmt, ...) \

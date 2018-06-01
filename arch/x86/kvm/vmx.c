@@ -33,6 +33,8 @@
 #include <linux/slab.h>
 #include <linux/tboot.h>
 #include <linux/hrtimer.h>
+//Charm
+#include <linux/prints.h>
 #include "kvm_cache_regs.h"
 #include "x86.h"
 
@@ -6411,6 +6413,10 @@ static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
 	if (unlikely(ret == RET_MMIO_PF_RETRY))
 		return 1;
 
+	//Charm start
+	kvm_mmu_page_fault(vcpu, gpa, 0, NULL, 0);
+	return 1;
+	//Charm end
 	/* It is the real ept misconfig */
 	WARN_ON(1);
 
